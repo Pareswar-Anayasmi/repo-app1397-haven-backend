@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-expert-assistant-backend
+data:
+  AIEXPERT_LOG_LEVEL: "DEBUG"
+  DEFAULT_LOG_LEVEL: "INFO"
+
+  AZURE__MONITOR_LOG_LEVEL: "ERROR"
+  AZURE__CORE_LOG_LEVEL: "ERROR"
+
+  ALLOWED_ORIGINS: ""
+
+  DB_USER: "app_user"
+  DB_DB_NAME: ""
+  DB_HOST: ""
+
+  TZ: "Europe/Stockholm"
+
+  LOGGING_AZURE_MONITOR: "false"
+
+  OTEL_PYTHON_DISABLED_INSTRUMENTATIONS: "fastapi"
+
+  FRONTEND_URL: ""
+
+  AUTHEN_OIDC_BASE_URL: ""
+  AUTHEN_OIDC_LOGIN_PATH: "/v3/azure/login"
+  AUTHEN_OIDC_JWKS_PATH: "/.well-known/jwt/jwks"
+  AUTHEN_OIDC_CLIENT_ID: "ai_expert_assistant"
+  AUTHEN_OIDC_TOKEN_PATH: "/v3/oauth2/token"
+  AUTHEN_OIDC_REDIRECT_URI: ""
+  AUTHEN_OIDC_ISSUER_FOR_SERVICE_ACCOUNT: 
+  
+  SYSTEM_GROUP_ID: "ai-expert-assistant"
+  IT_ADMIN_GROUP_MIDDLE_NAME: "ai-expert-assistant-qa"
+
+  DIAM_SERVICE_ACCOUNT_CLIENT_ID: "ai-expert-assistant-system"
+  DIAM_API_ENDPOINT_PATH: "/v3"
+
+  SESSION_COOKIE_DOMAIN: ""
+
+  DB_POOL_SIZE: "10"
+

@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-expert-assistant-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ai-expert-assistant-backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: ai-expert-assistant-backend
+    spec:
+      containers:
+      - name: container
+        image: cr00cfaroregistry.azurecr.io/ai-expert-assistant/backend:$(latestTag)
+        imagePullPolicy: Always
+        env:
+        - name: ENV_PATH
+          value: "/mnt/config/.secrets"
+        envFrom:
+        - configMapRef:
+            name: ai-expert-assistant-backend
+        volumeMounts:
+        - name: ai-expert-assistant-backend
+          mountPath: /mnt/config
+          readOnly: true   
+        ports:
+        - containerPort: 8000
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        # command: ["/bin/sh", "-ec", "sleep 1000"]
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: ai-expert-assistant-backend
+        secret:
+          secretName: ai-expert-assistant-backend
+

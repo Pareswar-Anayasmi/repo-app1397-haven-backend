@@ -1,0 +1,125 @@
+@startuml authn_and_authz
+
+autoactivate on
+title Authentication & Authorization Flow
+hide footbox
+
+actor User
+participant "EntraID" as entraid
+participant "DIAM" as diam #greenyellow
+participant "AI Expert Assistant\nFrontend (Web)" as aiexpert_frontend  #lightblue
+participant "AI Expert Assistant\nBackend (API))" as aiexpert_backend  #lightblue
+participant "LegalAI Expert Assistant\nBackend (API)" as leaglaiexpert_backend #yellow
+
+
+User -> aiexpert_frontend: HTTPS GET /
+aiexpert_frontend -> aiexpert_frontend: Check if \nsession cookie exists
+return
+
+note right of User: Assume the user has no session cookie
+return \nHTTP 301 Redirect (Location: aiexpert_backend /authen/login)
+
+User -> aiexpert_backend: \n\nHTTPS GET /authen/login
+return HTTP 301 Redirect (Location EntraID /authorize)
+
+
+User -> entraid: \n\nHTTPS GET /authorize
+return HTTP 200 OK (Content: Login Screen)  
+
+User -> entraid: \n\nEnter username/password/MFA
+note right of User: Assume the authentication is successful\nAuthorization code is returned
+return HTTP 301 Redirect (Location: DIAM /callback?code=XYZ)
+
+
+User -> diam: \n\nHTTPS GET /callback?code=XYZ
+
+diam -> entraid: HTTP /token (Get access_token and \nrefresh_token from code)
+
+
+ return \n\nHTTP 200 OK (JSON: access_token \nand refresh_token)
+
+== Authentication with EntraID is completed ==
+
+diam -> diam: \n\nCreate DIAM access_token (d_access_token) \nand refresh_token (d_refresh_token)
+return
+
+
+return \nHTTP 301 Redirect (Location: AI Expert Assistant Backend\n /callback?access_token=d_access_token&refresh_token=d_refresh_token)
+
+
+User -> aiexpert_backend: \n\nHTTPS GET /callback?access_token=d_access_token&refresh_token=d_refresh_token
+
+aiexpert_backend -> diam: \n\nHTTPS GET /jwks (Get public key)
+note left of aiexpert_backend: Public key is used to \nverify the d_access_token. \nThe public key can be cached.
+
+return \n\nHTTP 200 OK (JSON: Public Key)
+
+aiexpert_backend -> aiexpert_backend: Verify d_access_token \nwith the public key
+return
+
+aiexpert_backend -> aiexpert_backend: Check if the user has "PENDING" invite
+alt Pending invite
+    aiexpert_backend -> aiexpert_backend: Update the user's status \nfrom "PENDING" to "CONFIRMED"
+    return
+    aiexpert_backend -> diam: Add user to the system group \n**ai-expert-assistant**
+    return
+    aiexpert_backend -> diam: Add user to the organization groups
+    return
+end
+return
+
+
+aiexpert_backend -> aiexpert_backend: Verify if the User \nis in the group \n**ai-expert-assistant** \nspecified in d_access_token
+return
+
+aiexpert_backend -> aiexpert_backend: Store d_refresh_tokens
+return
+
+aiexpert_backend -> aiexpert_backend: Create a session cookie
+return
+
+return \n\nHTTP 301 Redirect (Location: AI Expert Assistant Frontend / \nwith session cookie)
+
+User -> aiexpert_frontend: \n\nHTTPS GET / with session cookie
+aiexpert_frontend -> aiexpert_frontend: Check if \nsession cookie exists
+
+return
+return HTTP 200 OK (Content: AI Expert Asisstant Landing Page)
+
+== User is authorized to access AI Expert Asisstant landing page  ==
+
+
+== Call LegalAI Expert Assistant's API  ==
+
+note right of User: Initially, the browser does not have \nd_access_token for the API call
+
+
+User -> leaglaiexpert_backend: \n\nHTTPS POST /chat
+return HTTP 401 Unauthorized (Content: Error: \nAccess token is missing)
+
+
+User -> aiexpert_backend: \n\nHTTPS GET /token with session cookie
+aiexpert_backend -> aiexpert_backend: Look up d_refresh_token \nby session cookie
+return
+
+aiexpert_backend -> diam: \n\nHTTP /token (Get access_token from refresh_token)
+return \n\nHTTP 200 OK (JSON: d_access_token)
+
+return \n\nHTTP 200 OK (JSON: d_access_token)
+
+User -> leaglaiexpert_backend: \n\nHTTPS POST /chat with bearer d_access_token
+
+leaglaiexpert_backend -> diam: \n\nHTTPS GET /jwks (Get public key)
+note left of leaglaiexpert_backend: Public key is used to \nverify the d_access_token. \nThe public key can be cached.
+
+return \n\nHTTP 200 OK (JSON: Public Key)
+
+leaglaiexpert_backend -> leaglaiexpert_backend: Verify d_access_token \nwith public key
+return
+
+
+leaglaiexpert_backend -> leaglaiexpert_backend: Verify if the User \nis in the group \n**legalai-expert-assistant** \nspecified in d_access_token
+return
+return \n\nHTTP 200 OK 
+
+@enduml

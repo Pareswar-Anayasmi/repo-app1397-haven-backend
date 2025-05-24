@@ -1,0 +1,15 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ai-expert-assistant-backend
+spec:
+  host: ai-expert-assistant-api-qa.apps.qaaro.global.hvwan.net
+  to:
+    kind: Service
+    name: ai-expert-assistant-backend
+  port:
+    targetPort: 8000-tcp
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
