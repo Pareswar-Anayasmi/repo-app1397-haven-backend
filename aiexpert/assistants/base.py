@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 ASSISTANT_CODE_LENGTH = 32
 
 
-async def get_assistant_by_code(groups, assistant_code, session: AsyncSession = None):
+async def get_assistant_by_code1(groups, assistant_code, session: AsyncSession = None):
     async def _run_query(session: AsyncSession):
         results = await session.execute(
             select(Assistants)
@@ -37,49 +37,57 @@ async def get_assistant_by_code(groups, assistant_code, session: AsyncSession = 
             return await _run_query(new_session)
         
 
-# async def get_assistant_by_code(groups, assistant_code, session: AsyncSession = None,c1=None,c2=None,c3=None):
-#     async def _run_query(c1,c2):
-#         query1="SELECT DISTINCT p.assistant_id FROM p WHERE ARRAY_CONTAINS(@groups, p.group_id)"
-#         params1 = [
-#             {"name": "@groups", "value": groups}
-#         ]
 
-#         assistant_ids = []
-#         try:
-#             async for item in c1.query_items(query=query1,parameters=params1):
-#                 assistant_ids.append(item['assistant_id'])
+async def get_assistant_by_code(groups, assistant_code, session=None):
+    async def _run_query(session):
+        assistants_container = await get_container_client("assistants")
+        permissions_container = await get_container_client("assistant_permissions")
 
-#         except Exception as e:
-#             logging.error(f"Error querying AssistantPermissions: {e}")
-#             return []
-        
-#         logging.info(f"assistantsss{assistant_ids}")
+        # Step 1: Find assistant by assistant_code
+        query_assistants = "SELECT * FROM c WHERE c.assistant_code = @code"
+        params_assistants = [{"name": "@code", "value": assistant_code}]
 
-#         query2 = "SELECT * FROM a WHERE a.assistant_code = @assistant_code AND ARRAY_CONTAINS(@assistant_ids, a.id)"
-        
-#         params2 = [
-#             {"name": "@assistant_code", "value": assistant_code},
-#             {"name": "@assistant_ids", "value": assistant_ids}
-#         ]
+        assistants = assistants_container.query_items(
+            query=query_assistants,
+            parameters=params_assistants
+        )
 
-#         assistants = []
-#         try:
-#             async for assistant in c2.query_items(query=query2,parameters=params2):
-#                 assistants.append(assistant)
+        assistant = None
+        async for item in assistants:
+            assistant = item
+            break
 
-#         except Exception as e:
-#             logging.exception(f"Error querying Assistants: {e}")
-#             return []
+        if not assistant:
+            return None
 
-#         return assistants
+        assistant_id = assistant["id"]  # Note dict access here
 
-#     if c1 and c2 :
-#         return await _run_query(c1,c2)
-#     else:
-#         c1= await get_container_client("assistant_permissions")
-#         c2= await get_container_client("assistants")
-#         return await _run_query(c1,c2)
+        # Step 2: Check permissions for this assistant_id in any of the groups
+        # Build OR conditions for group_id filter
+        group_conditions = " OR ".join([f"c.group_id = '{group_id}'" for group_id in groups])
+        permission_query = f"""
+            SELECT * FROM c
+            WHERE c.assistant_id = @assistant_id AND ({group_conditions})
+        """
+        permission_params = [{"name": "@assistant_id", "value": assistant_id}]
 
+        permissions = permissions_container.query_items(
+            query=permission_query,
+            parameters=permission_params
+        )
+
+        async for _ in permissions:
+            # Permission found, return the assistant dict as is
+            return assistant
+
+        # No permissions found
+        return None
+
+    if session:
+        return await _run_query(session)
+    else:
+        async with async_session_maker() as new_session:
+            return await _run_query(new_session)
 
 async def get_assistants1(groups, page, per_page):
     async with async_session_maker() as session:
@@ -447,7 +455,7 @@ async def register_new_assistant1(assistant_details, user):
         except:
             raise ValueError("Assistant registration failed")
 
-async def get_owner1(assistant_code, user):
+async def get_owner(assistant_code, user):
     async with async_session_maker() as session:
         assistants: Assistants = await get_assistant_by_code(
             user.groups, assistant_code, session
@@ -474,7 +482,7 @@ async def get_owner1(assistant_code, user):
             "owner": rows.created_by
         }
     
-async def get_owner(assistant_code, user):
+async def get_owner1(assistant_code, user):
     # Get Cosmos containers
     permissions_container = await get_container_client("assistant_permissions")
     organization_container = await get_container_client("organization_groups")

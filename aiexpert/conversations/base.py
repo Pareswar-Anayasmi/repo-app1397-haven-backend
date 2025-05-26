@@ -213,8 +213,7 @@ async def update_summary_record(thread_id, user: User, summary):
 
     items = conv_sum_con.query_items(
         query=query,
-        parameters=parameters,
-        enable_cross_partition_query=True
+        parameters=parameters
     )
 
     records = [item async for item in items]
@@ -265,7 +264,7 @@ async def _get_summary_record(thread_id, session: AsyncSession):
     results = []
     async for item in container.query_items(
         query=query,
-        parameters=parameters,
+        parameters=parameters
         
     ):
         results.append(item)
@@ -463,7 +462,6 @@ async def delete_summary_record(thread_id: str, user: User, assistant_code: str 
                 )
             )
             return True
-
 
 # Function to mark or unmark a conversation as favorite
 async def mark_conversation_favorite1(thread_id, favorite, user: User):
