@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 ASSISTANT_CODE_LENGTH = 32
 
 
-async def get_assistant_by_code1(groups, assistant_code, session: AsyncSession = None):
+async def get_assistant_by_code(groups, assistant_code, session: AsyncSession = None):
     async def _run_query(session: AsyncSession):
         results = await session.execute(
             select(Assistants)
@@ -38,7 +38,7 @@ async def get_assistant_by_code1(groups, assistant_code, session: AsyncSession =
         
 
 
-async def get_assistant_by_code(groups, assistant_code, session=None):
+async def get_assistant_by_code1(groups, assistant_code, session=None):
     async def _run_query(session):
         assistants_container = await get_container_client("assistants")
         permissions_container = await get_container_client("assistant_permissions")
@@ -455,7 +455,7 @@ async def register_new_assistant1(assistant_details, user):
         except:
             raise ValueError("Assistant registration failed")
 
-async def get_owner(assistant_code, user):
+async def get_owner1(assistant_code, user):
     async with async_session_maker() as session:
         assistants: Assistants = await get_assistant_by_code(
             user.groups, assistant_code, session
@@ -482,25 +482,71 @@ async def get_owner(assistant_code, user):
             "owner": rows.created_by
         }
     
-async def get_owner1(assistant_code, user):
+# async def get_owner(assistant_code, user):
+#     # Get Cosmos containers
+#     permissions_container = await get_container_client("assistant_permissions")
+#     organization_container = await get_container_client("organization_groups")
+
+#     # Get assistant object by code from Cosmos (you must ensure this function exists and works)
+#     assistants = await get_assistant_by_code(user.groups, assistant_code)
+
+#     if assistants is None:
+#         raise ValueError("Invalid assistant_code provided")
+
+#     # Query assistant_permissions container
+#     query_permissions = "SELECT * FROM c WHERE c.assistant_id = @assistant_id"
+#     params_permissions = [{"name": "@assistant_id", "value": assistants["id"]}]
+
+#     permission_items = permissions_container.query_items(
+#         query=query_permissions,
+#         parameters=params_permissions
+    
+#     )
+#     permissions = [item async for item in permission_items]
+
+#     if not permissions:
+#         raise ValueError("Assistant not found")
+
+#     permission = permissions[0]
+
+#     # Query organization_groups container
+#     query_org = "SELECT c.created_by FROM c WHERE c.group_id = @group_id"
+#     params_org = [{"name": "@group_id", "value": permission["group_id"]}]
+
+#     org_items = organization_container.query_items(
+#         query=query_org,
+#         parameters=params_org
+#         # enable_cross_partition_query=True,
+#     )
+#     org_results = [item async for item in org_items]
+
+#     if not org_results:
+#         raise ValueError("Owner not found")
+
+#     owner = org_results[0]["created_by"]
+
+#     return {
+#         "assistant_id": permission["assistant_id"],
+#         "owner": owner,
+#     }
+async def get_owner(assistant_code, user):
     # Get Cosmos containers
     permissions_container = await get_container_client("assistant_permissions")
     organization_container = await get_container_client("organization_groups")
 
-    # Get assistant object by code from Cosmos (you must ensure this function exists and works)
+    # Get assistant object by code from Cosmos
     assistants = await get_assistant_by_code(user.groups, assistant_code)
 
     if assistants is None:
         raise ValueError("Invalid assistant_code provided")
 
-    # Query assistant_permissions container
+    # Access the id attribute, not as dictionary
     query_permissions = "SELECT * FROM c WHERE c.assistant_id = @assistant_id"
-    params_permissions = [{"name": "@assistant_id", "value": assistants["id"]}]
+    params_permissions = [{"name": "@assistant_id", "value": assistants.id}]
 
     permission_items = permissions_container.query_items(
         query=query_permissions,
         parameters=params_permissions
-        # enable_cross_partition_query=True,
     )
     permissions = [item async for item in permission_items]
 
@@ -509,14 +555,12 @@ async def get_owner1(assistant_code, user):
 
     permission = permissions[0]
 
-    # Query organization_groups container
     query_org = "SELECT c.created_by FROM c WHERE c.group_id = @group_id"
     params_org = [{"name": "@group_id", "value": permission["group_id"]}]
 
     org_items = organization_container.query_items(
         query=query_org,
         parameters=params_org
-        # enable_cross_partition_query=True,
     )
     org_results = [item async for item in org_items]
 
