@@ -438,7 +438,7 @@ async def get_summary_records(user: User, page: int = 1, per_page: int = 10, ord
         log.exception("Error while fetching conversation history from Cosmos DB")
         return {"total_records": 0, "records": []}
 
-async def delete_summary_record(thread_id: str, user: User, assistant_code: str = None):
+async def delete_summary_record1(thread_id: str, user: User, assistant_code: str = None):
     async with async_session_maker() as session:
         async with session.begin():
             # for backward compatibility, we do not mandate the assistant_code for now
@@ -462,6 +462,41 @@ async def delete_summary_record(thread_id: str, user: User, assistant_code: str 
                 )
             )
             return True
+
+async def delete_summary_record(thread_id: str, user: User, assistant_code: str = None):
+    async with async_session_maker() as session:
+        async with session.begin():
+            # for backward compatibility, we do not mandate the assistant_code for now
+            if assistant_code:
+                assistants: Assistants = await get_assistant_by_code(
+                    user.groups, assistant_code, session
+                )
+
+                if assistants is None:
+                    raise ValueError("Invalid assistant_code provided")
+            
+            existing_records = await _get_summary_record(thread_id, session)
+
+            if not existing_records:
+                return False
+
+            # Assuming the first matching record is the one we want
+            record = existing_records[0]
+
+            summary_container = await get_container_client("conversation_summary")
+
+            try:
+                await summary_container.delete_item(
+                    item=record["id"],
+                    partition_key=record["user_id"]
+                )
+            except Exception as e:
+                print(f"⚠️ Error deleting item from Cosmos DB: {e}")
+                return False
+
+            return True
+
+
 
 # Function to mark or unmark a conversation as favorite
 async def mark_conversation_favorite1(thread_id, favorite, user: User):
