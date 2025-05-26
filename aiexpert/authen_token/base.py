@@ -33,11 +33,13 @@ from datetime import datetime, timedelta
 
 import logging
 
+from ..create_container_client import get_container_client
+
 log = logging.getLogger(__name__)
 
 PRE_EXPIRY_BUFFER = timedelta(minutes=5)
 
-async def delete_tokens(token_id: str):
+async def delete_tokens1(token_id: str):
     """
     Delete the token from the database
     """
@@ -52,8 +54,21 @@ async def delete_tokens(token_id: str):
 
             await session.delete(token)
 
+async def delete_tokens(token_id: str):
+    """
+     Delete the token from the Cosmos DB (MongoDB API)
+    """
+    tokens_collection = get_container_client("authen_tokens")
+    async with async_session_maker() as session:
+        async with session.begin():          
+            result = await tokens_collection.delete_one({"session_key": token_id})
+            if result.deleted_count == 0:
+                log.debug("Cannot find a token record with ID: %s", token_id)
+ 
+            await session.delete(result)
+ 
 
-async def _add_to_users(user: User):
+async def _add_to_users1(user: User):
     async with async_session_maker() as session:
         # add user to users table
         result = await session.execute(select(Users).where(Users.diam_user_id == user.sub))
@@ -66,6 +81,19 @@ async def _add_to_users(user: User):
         else:
             log.debug("User %s is found in users table.", user.email)
 
+async def _add_to_users(user: User):
+    users_collection = get_container_client("users")
+    async with async_session_maker() as session:
+        # add user to users table
+        diam_user = await users_collection.find_one({"diam_user_id": user.sub})
+ 
+        if not diam_user:
+            log.debug("User %s cannot be found. Add to users table.", user.email)
+            session.add(Users(diam_user_id=user.sub, email=user.email))
+            await session.commit()
+        else:
+            log.debug("User %s is found in users table.", user.email)
+ 
 
 def _token_has_system_group(access_token: str):
     user: User = get_user(access_token, use_cache=False, verify_aud=False)
@@ -73,7 +101,7 @@ def _token_has_system_group(access_token: str):
     
     return user, (SYSTEM_GROUP_ID in user.groups)
 
-async def _process_pending_invitation(user: User, has_system_group: bool):
+async def _process_pending_invitation1(user: User, has_system_group: bool):
     has_pending_invitation = False
     async with async_session_maker() as session:
         result = await session.execute(
@@ -131,6 +159,64 @@ async def _process_pending_invitation(user: User, has_system_group: bool):
     
     return has_pending_invitation
 
+async def _process_pending_invitation(user: User, has_system_group: bool):
+    group_users_collection = get_container_client("group_users")
+    has_pending_invitation = False
+    async with async_session_maker() as session:      
+ 
+        cursor = group_users_collection.find({
+             "email": user.email,
+              "status": "PENDING"
+        })
+        group_users = await cursor.to_list(length=None)
+       
+        log.debug("Pending group users: %s", [g.to_dict() for g in group_users])
+       
+        if group_users:
+            has_pending_invitation = True
+       
+            await _add_to_users(user)
+       
+            pending_group_ids = [g.group_id for g in group_users]
+                           
+            if not has_system_group:
+                # first add user to the system group
+                await add_user_to_group(diam_user_id=user.sub, group_id=SYSTEM_GROUP_ID)
+           
+            for group_id in pending_group_ids:
+                # call DIAM to add user into the group
+                try:
+                    ####
+                    #
+                    # IMPORTANT: Intentionally update the db record first before calling DIAM.
+                    # This avoids DIAM call successful but db update failed which means a user
+                    # can access the assistant without being shown in the group
+                    #
+                    ####
+ 
+                    result = await group_users_collection.update_one(
+                         {
+                             "email": user.email,
+                             "status": "PENDING",
+                            "group_id": group_id
+                        },
+                        {
+                        "$set": {
+                            "status": "CONFIRMED",
+                            "joined_at": datetime.utcnow()
+                            }
+                        }
+                    )                  
+                    await add_user_to_group(diam_user_id=user.sub, group_id=group_id)
+                   
+                    log.info("User (%s) has been added to the group (%s) successfully", user.email, group_id)
+ 
+                except Exception:
+                    log.exception("Error in adding user (%s) to the group (%s)", user.email, group_id)
+   
+    return has_pending_invitation
+ 
+
 async def save_tokens(existing_token_id, access_token: str, refresh_token: str):
     """
     Verify the access token from the OAuth2 provider
@@ -174,7 +260,53 @@ async def save_tokens(existing_token_id, access_token: str, refresh_token: str):
         
     return await _save_tokens(user, existing_token_id, refresh_token), access_token
 
-async def _save_tokens(user: User, existing_token_id: str, refresh_token: str):
+
+async def save_tokens(existing_token_id, access_token: str, refresh_token: str):
+    """
+    Verify the access token from the OAuth2 provider
+    and store the encrypted access token and refresh token in the Cosmos DB
+
+    return the token_id that can be used to retrieve the tokens
+    """
+    
+    # User may have been invited to join the app
+    user, has_system_group = _token_has_system_group(access_token)
+    log.debug("User has the required group (%s)? %s", SYSTEM_GROUP_ID, has_system_group)
+
+    has_pending_invitation = await _process_pending_invitation(user, has_system_group)
+    
+    if not has_system_group and not has_pending_invitation:
+        raise AuthError("User does not have the required permission", 403)
+    
+    force_refresh_token = False
+    if has_pending_invitation:
+        log.debug("New groups added to user: %s, force to refresh the token", user.id)
+        force_refresh_token = True
+        
+    current_datetime = datetime.now().astimezone()
+    expire_at = datetime.fromtimestamp(user.data.get("exp", 0)).astimezone()
+    log.debug(
+        "The token for the user: %s is expired at: %s. Current date time: %s. Pre-expiry buffer: %s ",
+        user.id,
+        expire_at,
+        current_datetime,
+        PRE_EXPIRY_BUFFER,
+    )
+    if expire_at < (current_datetime + PRE_EXPIRY_BUFFER):
+        log.debug("The token for the user: %s is about to expire, force to refresh the token", user.id)
+        force_refresh_token = True
+        
+    if force_refresh_token: 
+        new_tokens = await _refresh_tokens(refresh_token)
+        
+        access_token = new_tokens["access_token"]
+        refresh_token = new_tokens["refresh_token"]
+        
+    # Call the Cosmos DB version of _save_tokens
+    return await _save_tokens(user, existing_token_id, refresh_token), access_token
+
+
+async def _save_tokens1(user: User, existing_token_id: str, refresh_token: str):
     token_id = existing_token_id
 
     encrypted_tokens = encrypt(refresh_token, AUTHEN_TOKEN_ENCRYPTION_KEY)
@@ -213,7 +345,44 @@ async def _save_tokens(user: User, existing_token_id: str, refresh_token: str):
     return token_id        
 
 
-async def get_tokens(token_id: str):
+async def _save_tokens(user: User, existing_token_id: str, refresh_token: str):
+    token_id = existing_token_id
+    encrypted_tokens = encrypt(refresh_token, AUTHEN_TOKEN_ENCRYPTION_KEY)
+    authen_token_container = await get_container_client("AuthenTokens")
+
+    if not existing_token_id:
+        # Generate new token ID
+        token_id = base64.b64encode(
+            (str(uuid.uuid4()) + str(int(time.time()))).encode()
+        ).decode()
+
+        item = {
+            "id": token_id,
+            "session_key": token_id,
+            "encrypted_tokens": encrypted_tokens,
+            "refreshed_at": datetime.utcnow().isoformat(),
+            "user_id": user.id  # Optional, if needed for partitioning or metadata
+        }
+
+        await authen_token_container.create_item(item=item, partition_key=token_id)
+
+    else:
+        # Try to read and update the token
+        try:
+            existing_item = await authen_token_container.read_item(item=token_id, partition_key=token_id)
+        except Exception:
+            log.error("Cannot find a token record with ID: %s", token_id)
+            raise AuthError("Cannot find a token record.", 401)
+
+        existing_item["encrypted_tokens"] = encrypted_tokens
+        existing_item["refreshed_at"] = datetime.utcnow().isoformat()
+
+        await authen_token_container.replace_item(item=token_id, body=existing_item)
+
+    return token_id
+
+
+async def get_tokens1(token_id: str):
     """
     Get token from DB by using token_id
     If the token is expired, try to refresh the token and a new token_id will be returned
@@ -245,6 +414,47 @@ async def get_tokens(token_id: str):
             _, access_token = await save_tokens(token_id, access_token, refresh_token)
 
             return access_token
+        
+async def get_tokens(token_id: str):
+    """
+    Get token from Cosmos DB using token_id (session_key).
+    If the token is expired, try to refresh it and return the new access_token.
+    """
+    authen_token_container = await get_container_client("AuthenTokens")
+
+    # Query the token by session_key
+    query = "SELECT * FROM c WHERE c.session_key = @token_id"
+    parameters = [{"name": "@token_id", "value": token_id}]
+
+    tokens_iterable = authen_token_container.query_items(
+        query=query,
+        parameters=parameters,
+        partition_key=token_id,  # Adjust if session_key is not the partition key
+    )
+
+    auth_token = None
+    async for item in tokens_iterable:
+        auth_token = item
+        break
+
+    if not auth_token:
+        log.error("Cannot find a token record with ID: %s", token_id)
+        raise AuthError("Cannot find a token record.", 401)
+
+    # Decrypt the token
+    refresh_token = decrypt(auth_token["encrypted_tokens"], AUTHEN_TOKEN_ENCRYPTION_KEY)
+
+    # Keep this line exactly as-is
+    new_token = await _refresh_tokens(refresh_token)
+
+    access_token = new_token["access_token"]
+    refresh_token = new_token["refresh_token"]
+
+    # Save new tokens
+    _, access_token = await save_tokens(token_id, access_token, refresh_token)
+
+    return access_token
+
 
 
 async def _refresh_tokens(refresh_token: str):
