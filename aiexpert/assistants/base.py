@@ -1,3 +1,4 @@
+import uuid
 from sqlalchemy import func, select, or_
 from ..sql.connection import async_session_maker
 from ..sql.schema import Assistants, AssistantPermissions, OrganizationGroups, GroupUsers
@@ -285,7 +286,7 @@ def validate_email(email):
     email_re = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
     return bool(re.match(email_re, email))
 
-async def register_new_assistant(assistant_details, user):
+async def register_new_assistant1(assistant_details, user):
     if not assistant_details.assistant_name:
         raise ValueError("Assistant name is required.")
 
@@ -445,9 +446,8 @@ async def register_new_assistant(assistant_details, user):
             }
         except:
             raise ValueError("Assistant registration failed")
-        
 
-async def get_owner(assistant_code, user):
+async def get_owner1(assistant_code, user):
     async with async_session_maker() as session:
         assistants: Assistants = await get_assistant_by_code(
             user.groups, assistant_code, session
@@ -473,4 +473,198 @@ async def get_owner(assistant_code, user):
             "assistant_id": rows.assistant_id,
             "owner": rows.created_by
         }
-      
+    
+async def get_owner(assistant_code, user):
+    # Get Cosmos containers
+    permissions_container = await get_container_client("assistant_permissions")
+    organization_container = await get_container_client("organization_groups")
+
+    # Get assistant object by code from Cosmos (you must ensure this function exists and works)
+    assistants = await get_assistant_by_code(user.groups, assistant_code)
+
+    if assistants is None:
+        raise ValueError("Invalid assistant_code provided")
+
+    # Query assistant_permissions container
+    query_permissions = "SELECT * FROM c WHERE c.assistant_id = @assistant_id"
+    params_permissions = [{"name": "@assistant_id", "value": assistants["id"]}]
+
+    permission_items = permissions_container.query_items(
+        query=query_permissions,
+        parameters=params_permissions
+        # enable_cross_partition_query=True,
+    )
+    permissions = [item async for item in permission_items]
+
+    if not permissions:
+        raise ValueError("Assistant not found")
+
+    permission = permissions[0]
+
+    # Query organization_groups container
+    query_org = "SELECT c.created_by FROM c WHERE c.group_id = @group_id"
+    params_org = [{"name": "@group_id", "value": permission["group_id"]}]
+
+    org_items = organization_container.query_items(
+        query=query_org,
+        parameters=params_org
+        # enable_cross_partition_query=True,
+    )
+    org_results = [item async for item in org_items]
+
+    if not org_results:
+        raise ValueError("Owner not found")
+
+    owner = org_results[0]["created_by"]
+
+    return {
+        "assistant_id": permission["assistant_id"],
+        "owner": owner,
+    }
+
+async def register_new_assistant(assistant_details, user):
+    if not assistant_details.assistant_name:
+        raise ValueError("Assistant name is required.")
+    if not assistant_details.assistant_owner:
+        raise ValueError("Assistant administrator is required.")
+    if not validate_email(assistant_details.assistant_owner):
+        raise ValueError("Assistant administrator email is not valid.")
+    if not assistant_details.description:
+        raise ValueError("Assistant description is required.")
+    if not assistant_details.endpoint:
+        raise ValueError("Assistant endpoint is required.")
+
+    assistant_owner_email = assistant_details.assistant_owner.lower()
+    group_name = assistant_details.assistant_name.lower().replace(':', '').replace(' ', '-')
+
+    # Fetch user groups from Cosmos DB
+    user_groups = await get_user_groups(user)
+
+    organizationGroups = await get_container_client("organization_groups")
+    groupUsers = await get_container_client("group_users")
+    assistants = await get_container_client("assistants")
+
+    query = f"SELECT * FROM c WHERE c.group_name = '{IT_ADMIN_GROUP_NAME}'"
+
+    it_admin_group_result = []
+
+    async for item in organizationGroups.query_items(
+        query=query
+    ):
+        it_admin_group_result.append(item)
+
+    # Validate result
+    if not it_admin_group_result:
+        raise ValueError(f"No group found with name: {IT_ADMIN_GROUP_NAME}")
+
+    it_admin_group = it_admin_group_result[0]
+
+    if it_admin_group.get("group_id") not in user_groups:
+        raise AuthError("Unauthorized to register assistant.", 403)
+
+
+
+    # Get existing DIAM groups
+    groups_list = await get_groups()
+
+    admin_org_group_name = f"{SYSTEM_GROUP_ID}:{group_name}:{ROLE_ADMIN}"
+    user_org_group_name = f"{SYSTEM_GROUP_ID}:{group_name}:{ROLE_USER}"
+
+    if any(group["name"] in {admin_org_group_name, user_org_group_name} for group in groups_list["records"]):
+        raise ValueError("Group already exists in DIAM.")
+
+    try:
+        # Create DIAM groups
+        admin_org_group_diam = await create_organization_group(org_group_name=admin_org_group_name)
+        user_org_group_diam = await create_organization_group(org_group_name=user_org_group_name)
+
+        admin_org_group_id = admin_org_group_diam["data"]["id"]
+        user_org_group_id = user_org_group_diam["data"]["id"]
+
+        group_desc = f"Group for {assistant_details.assistant_name}"
+        now = datetime.utcnow().isoformat()
+
+        # Create org groups in Cosmos DB
+        await organizationGroups.create_item({
+            "id": str(uuid.uuid4()),
+            "group_id": admin_org_group_id,
+            "group_name": admin_org_group_name,
+            "group_title": assistant_details.assistant_name,
+            "group_description": group_desc,
+            "assistant_group_name": group_name,
+            "role_name": ROLE_ADMIN,
+            "created_by": assistant_owner_email,
+            "updated_by": assistant_owner_email,
+            "created_at": now,
+            "updated_at": now
+        })
+
+        await organizationGroups.create_item({
+            "id": str(uuid.uuid4()),
+            "group_id": user_org_group_id,
+            "group_name": user_org_group_name,
+            "group_title": assistant_details.assistant_name,
+            "group_description": group_desc,
+            "assistant_group_name": group_name,
+            "role_name": ROLE_USER,
+            "created_by": assistant_owner_email,
+            "updated_by": assistant_owner_email,
+            "created_at": now,
+            "updated_at": now
+        })
+
+        # Create group users
+        await groupUsers.create_item({
+            "id": str(uuid.uuid4()),
+            "group_id": admin_org_group_id,
+            "email": user.email,
+            "status": PENDING_USER_STATUS,
+            "joined_at": now,
+            "created_at": now,
+            "updated_at": now
+        })
+
+        await groupUsers.create_item({
+            "id": str(uuid.uuid4()),
+            "group_id": admin_org_group_id,
+            "email": assistant_owner_email,
+            "status": PENDING_USER_STATUS,
+            "joined_at": now,
+            "created_at": now,
+            "updated_at": now
+        })
+
+        # Create assistant
+        assistant_code = await generate_assistant_code()
+        assistant_id = str(uuid.uuid4())
+
+        await assistants.create_item({
+            "id": assistant_id,
+            "assistant_name": assistant_details.assistant_name,
+            "description": assistant_details.description,
+            "endpoint": assistant_details.endpoint,
+            "assistant_code": assistant_code,
+            "created_at": now,
+            "updated_at": now
+        })
+
+        # Add permissions
+        await assistants.upsert_item({
+            "id": assistant_id,
+            "permissions": [
+                {"group_id": admin_org_group_id},
+                {"group_id": user_org_group_id}
+            ]
+        })
+
+        return {
+            "assistant_name": assistant_details.assistant_name,
+            "assistant_code": assistant_code,
+            "group_name": group_name,
+            "group_description": group_desc,
+            "admin_group_id": admin_org_group_id,
+            "user_group_id": user_org_group_id
+        }
+
+    except Exception as e:
+        raise ValueError(f"Assistant registration failed: {str(e)}")

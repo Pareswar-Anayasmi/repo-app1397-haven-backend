@@ -7,8 +7,8 @@ from ..diam.group_utils import delete_user_from_group, add_user_to_group
 from sqlalchemy.ext.asyncio import AsyncSession
 from ..utils.configurations import ROLE_ADMIN, PENDING_USER_STATUS, CONFIRMED_USER_STATUS
 from fastapi import HTTPException
-from datetime import datetime
 from ..create_container_client import get_container_client
+from datetime import datetime
 import logging
 import re
 
@@ -24,6 +24,7 @@ async def get_assistant_group_details1(assistant_group_name: str):
         results = await session.execute(query)
 
         return results.scalars().all()
+
 async def get_assistant_group_details(assistant_group_name: str):
     assistant_details_container = await get_container_client("organization_groups")
  
@@ -42,7 +43,8 @@ async def get_assistant_group_details(assistant_group_name: str):
         results.append(item)
  
     return results
-async def get_user_groups(user):
+
+async def get_user_groups1(user):
     async with async_session_maker() as session:
         try:
             og = aliased(OrganizationGroups)
@@ -81,8 +83,43 @@ async def get_user_groups(user):
             log.exception("Error while fetching groups")
             return {"records": []}
 
+async def get_user_groups(user):
+    try:
+        assistant_details_container = await get_container_client("organization_groups")
+ 
+        # Fix: use `id` instead of `group_id`
+        query = f"""
+        SELECT * FROM c WHERE c.id IN ({','.join([f'"{g}"' for g in user.groups])})
+        """
+ 
+        items = assistant_details_container.query_items(
+            query=query,
+            #enable_cross_partition_query=True,
+        )
+ 
+        results = [item async for item in items]
+ 
+        print("Matched records:", results)  # Debug log
+ 
+        return {
+            "records": [
+                {
+                    "group_id": r.get("id"),  # from Cosmos document's id
+                    "group_name": r.get("assistant_group_name"),
+                    "group_title": r.get("group_title"),
+                    "group_description": r.get("group_description"),
+                    "created_at": r.get("created_at"),
+                    "updated_at": r.get("updated_at"),
+                }
+                for r in results
+            ]
+        }
+ 
+    except Exception as e:
+        log.exception("Error while fetching groups")
+        return {"records": []}
 
-async def get_user_group_details(assistant_group_name, user):
+async def get_user_group_details1(assistant_group_name, user):
     async with async_session_maker() as session:
         try:
             # Fetch group details first
@@ -184,8 +221,119 @@ async def get_user_group_details(assistant_group_name, user):
             log.exception("Error while fetching group details")
             return {"record": []}
 
+async def get_user_group_details(assistant_group_name, user):
+    try:
+        groups_container = get_container_client("organization_groups")
+        group_users_container = get_container_client("group_users")
+ 
+        # Fetch group details - using query_iterable to check for empty results
+        group_query = f"""
+        SELECT TOP 1 * FROM g
+        WHERE g.assistant_group_name = @assistant_group_name
+        AND ARRAY_CONTAINS(@user_groups, g.group_id)
+        ORDER BY g.id
+        """
+       
+        group_result = groups_container.query_items(
+            query=group_query,
+            parameters=[
+                {"name": "@assistant_group_name", "value": assistant_group_name},
+                {"name": "@user_groups", "value": user.groups}
+            ],
+            enable_cross_partition_query=True
+        )
+       
+        # Convert to list to check if empty
+        group_records = list(group_result)
+        if not group_records:
+            return {"record": []}
+ 
+        group_record = group_records[0]
+ 
+        # Fetch group members
+        member_query = f"""
+        SELECT
+            g.assistant_group_name,
+            u.email,
+            u.status,
+            g.role_name,
+            u.joined_at,
+            u.created_at
+        FROM g JOIN u IN g.members
+        WHERE g.assistant_group_name = @assistant_group_name
+        """
+       
+        member_results = groups_container.query_items(
+            query=member_query,
+            parameters=[
+                {"name": "@assistant_group_name", "value": assistant_group_name}
+            ],
+            enable_cross_partition_query=True
+        )
+ 
+        members = {}
+        admin_user = False
+       
+        # Check if there are any members at all
+        has_members = False
+        async for member_row in member_results:
+            has_members = True
+            key = f"{member_row['email']}_{member_row['status']}"
+            member_record = {
+                "email": member_row["email"],
+                "role_name": member_row["role_name"],
+                "status": member_row["status"],
+                "joined_at": member_row.get("joined_at", ""),
+                "invited_at": member_row["created_at"],
+            }
+           
+            if (member_row["status"] == PENDING_USER_STATUS or
+                key not in members or
+                member_row["role_name"] == ROLE_ADMIN):
+                members[key] = member_record
+ 
+            if (user.email == member_row["email"] and
+                member_row["role_name"] == ROLE_ADMIN and
+                member_row["status"] == CONFIRMED_USER_STATUS):
+                group_checker = await _check_group_permission(
+                    assistant_group_name,
+                    user,
+                    groups_container
+                )
+                admin_user = bool(group_checker)
+ 
+        if not has_members:
+            return {
+                "record": {
+                    "group_name": group_record["assistant_group_name"],
+                    "group_description": group_record.get("group_description", ""),
+                    "group_title": group_record.get("group_title", ""),
+                    "created_at": group_record["created_at"],
+                    "updated_at": group_record.get("updated_at", ""),
+                    "created_by": group_record["created_by"],
+                    "admin_user": admin_user,
+                    "members": [],
+                }
+            }
+ 
+        return {
+            "record": {
+                "group_name": group_record["assistant_group_name"],
+                "group_description": group_record.get("group_description", ""),
+                "group_title": group_record.get("group_title", ""),
+                "created_at": group_record["created_at"],
+                "updated_at": group_record.get("updated_at", ""),
+                "created_by": group_record["created_by"],
+                "admin_user": admin_user,
+                "members": list(members.values()),
+            }
+        }
+ 
+    except Exception as e:
+        log.exception("Error while fetching group details from Cosmos DB")
+        return {"record": []}
 
-async def get_org_group_by_name_role(
+async def get_org_group_by_name_role1(
     assistant_group_name, role_name, session: AsyncSession = None
 ):
     async def _run_query(session: AsyncSession):
@@ -202,9 +350,29 @@ async def get_org_group_by_name_role(
     else:
         async with async_session_maker() as new_session:
             return await _run_query(new_session)
+async def get_org_group_by_name_role(assistant_group_name, role_name, session=None):
+    organization_groups_container = await get_container_client("organization_groups")
+ 
+    query = """
+    SELECT * FROM c
+    WHERE c.assistant_group_name = @group_name AND LOWER(c.role_name) = @role_name
+    """
+    parameters = [
+        {"name": "@group_name", "value": assistant_group_name},
+        {"name": "@role_name", "value": role_name.lower()},
+    ]
+ 
+    items = organization_groups_container.query_items(
+        query=query,
+        parameters=parameters,
+        #enable_cross_partition_query=True
+    )
+ 
+    async for item in items:
+        return item  # return the first matching group
+    return None
 
-
-async def get_org_group_by_name_email(
+async def get_org_group_by_name_email1(
     assistant_group_name, email, session: AsyncSession = None
 ):
     async def _run_query(session: AsyncSession):
@@ -224,9 +392,54 @@ async def get_org_group_by_name_email(
     else:
         async with async_session_maker() as new_session:
             return await _run_query(new_session)
+async def get_org_group_by_name_email(assistant_group_name, email, session=None):
+    group_users_container = await get_container_client("group_users")
+    organization_groups_container = await get_container_client("organization_groups")
+ 
+    # First, get the group_id from organization_groups
+    group_query = """
+    SELECT * FROM c
+    WHERE c.assistant_group_name = @group_name
+    """
+    group_parameters = [{"name": "@group_name", "value": assistant_group_name}]
+ 
+    group_items = organization_groups_container.query_items(
+        query=group_query,
+        parameters=group_parameters,
+       # enable_cross_partition_query=True
+    )
+ 
+    group = None
+    async for item in group_items:
+        group = item
+        break
+ 
+    if not group:
+        return None
+ 
+    group_id = group["group_id"]
+ 
+    # Now, check if user is already in this group_id
+    user_query = """
+    SELECT * FROM c
+    WHERE c.group_id = @group_id AND LOWER(c.email) = @user_email
+    """
+    user_parameters = [
+        {"name": "@group_id", "value": group_id},
+        {"name": "@user_email", "value": email.lower()},
+    ]
+ 
+    user_items = group_users_container.query_items(
+        query=user_query,
+        parameters=user_parameters,
+        #enable_cross_partition_query=True
+    )
+ 
+    async for user in user_items:
+        return user
+    return None
 
-
-async def _check_group_permission(
+async def _check_group_permission1(
     assistant_group_name, user, session: AsyncSession = None
 ):
     """
@@ -253,7 +466,37 @@ async def _check_group_permission(
         return org_group_id
     else:
         return None
-
+async def _check_group_permission(
+    assistant_group_name, user, session_or_container=None
+):
+    """
+    Check if the user has admin permission for the given assistant_group_name.
+    Supports Cosmos DB container only.
+    """
+    if session_or_container and hasattr(session_or_container, "query_items"):
+        container = session_or_container
+        query = """
+        SELECT c.group_id FROM c
+        WHERE c.assistant_group_name = @group_name
+        AND c.role_name = @role_admin
+        """
+        params = [
+            {"name": "@group_name", "value": assistant_group_name},
+            {"name": "@role_admin", "value": ROLE_ADMIN}
+        ]
+        items = container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True
+        )
+        async for item in items:
+            org_group_id = item.get("group_id")
+            if org_group_id and org_group_id in user.groups:
+                return org_group_id
+        return None
+ 
+    # If not a Cosmos container, do not support SQLAlchemy fallback
+    raise ValueError("A Cosmos DB container is required for permission checking.")
 
 # async def _get_group_user_record(group_id, email, session: AsyncSession):
 #     """
@@ -272,7 +515,7 @@ def validate_email(email):
     email_re = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
     return bool(re.match(email_re, email))
 
-async def assign_user_to_user_group(group_user_details, user):
+async def assign_user_to_user_group1(group_user_details, user):
     if not group_user_details.assistant_group_name:
         raise ValueError("Group name is required.")
 
@@ -325,9 +568,50 @@ async def assign_user_to_user_group(group_user_details, user):
             await session.flush()
 
             return group_user.to_dict()
+async def assign_user_to_user_group(group_user_details, user):
+    if not group_user_details.assistant_group_name:
+        raise ValueError("Group name is required.")
+ 
+    if not group_user_details.email:
+        raise ValueError("Email is required.")
+ 
+    if not group_user_details.role_name:
+        raise ValueError("Role is required.")
+ 
+    if not validate_email(group_user_details.email):
+        raise ValueError("Email is not valid.", "user_management#invalid_email")
+ 
+    email = group_user_details.email.lower()
+ 
+    # Get containers
+    organization_groups_container = await get_container_client("organization_groups")
+    group_users_container = await get_container_client("group_users")
+ 
+    # Get group info (to fetch group_id)
+    org_group = await get_org_group_by_name_role(
+        group_user_details.assistant_group_name,
+        group_user_details.role_name.lower()
+    )
+ 
+    if not org_group:
+        raise ValueError("Group with specified name and role not found.")
+ 
+    # Check permission (assume it’s using Cosmos — can modify this if needed)
+    group_checker = await _check_group_permission(
+        group_user_details.assistant_group_name,
+        user,
+        organization_groups_container
+    )
+ 
+    if not group_checker:
+        raise AuthError("Unauthorized to add user to group.", 403)
+ 
+    # Check if user already exists
+    group_user_exists = await get_org_group_by_name_email(
+        group_user_details.assistant_group_name, email
+    )
 
-
-async def delete_user_from_user_group(group_user_details, user):
+async def delete_user_from_user_group1(group_user_details, user):
     if not group_user_details.assistant_group_name:
         raise ValueError("Group name is required.")
 
@@ -387,8 +671,103 @@ async def delete_user_from_user_group(group_user_details, user):
                 return True
             
             return False
+async def delete_user_from_user_group(group_user_details, user):
+    if not group_user_details.assistant_group_name:
+        raise ValueError("Group name is required.")
+    if not group_user_details.email:
+        raise ValueError("Email is required.")
+ 
+    email = group_user_details.email.lower()
+    groups_container = get_container_client("organization_groups")
+    users_container = get_container_client("group_users")
+ 
+    try:
+        # 1. Get the organization group by name and email
+        org_group = await get_org_group_by_name_email(
+            group_user_details.assistant_group_name,
+            email,
+            groups_container
+        )
+        if not org_group:
+            return False
+ 
+        # 2. Check user permission to delete user from group
+        group_checker = await _check_group_permission(
+            group_user_details.assistant_group_name,
+            user,
+            groups_container
+        )
+        if not group_checker:
+            raise AuthError("Unauthorized to delete user from group.", 403)
+ 
+        if org_group.get("created_by", "").lower() == email:
+            raise ValueError("Group creator cannot be deleted.")
+ 
+        # 3. Find the group_user record in group_users container
+        query = """
+        SELECT * FROM c WHERE c.group_id = @group_id AND c.email = @user_email
+        """
+        params = [
+            {"name": "@group_id", "value": org_group["group_id"]},
+            {"name": "@user_email", "value": email}
+        ]
+        user_items = users_container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True
+        )
+        user_record = None
+        async for item in user_items:
+            user_record = item
+            break
+ 
+        if user_record:
+            # If user is not pending, remove from DIAM group
+            if user_record.get("status") != PENDING_USER_STATUS:
+                # Get DIAM id from user record if available
+                diam_user_id = user_record.get("diam_user_id")
+                if diam_user_id:
+                    await delete_user_from_group(
+                        diam_user_id=diam_user_id,
+                        group_id=org_group["group_id"]
+                    )
+ 
+            # Delete user from group_users container
+            await users_container.delete_item(
+                item=user_record["id"],
+                partition_key=user_record["group_id"]
+            )
+ 
+            # Remove user from group's members array (if denormalized)
+            try:
+                members = org_group.get("members", [])
+                new_members = [
+                    m for m in members if m.get("email", "").lower() != email
+                ]
+                if len(new_members) != len(members):
+                    patch_operation = [
+                        {
+                            "op": "replace",
+                            "path": "/members",
+                            "value": new_members
+                        }
+                    ]
+                    await groups_container.patch_item(
+                        item=org_group["id"],
+                        partition_key=org_group["group_id"],
+                        patch_operations=patch_operation
+                    )
+            except Exception as e:
+                log.warning(f"Could not update group members list: {str(e)}")
+ 
+            return True
+ 
+        return False
+ 
+    finally:
+        await connection1.get_cosmos_client.close()
 
-async def update_user_role_in_user_group(group_user_details, user):
+async def update_user_role_in_user_group1(group_user_details, user):
     if not group_user_details.assistant_group_name:
         raise ValueError("Group name is required.")
 
@@ -461,9 +840,159 @@ async def update_user_role_in_user_group(group_user_details, user):
                 .values(group_id=org_group_new.group_id, updated_at=datetime.now())
             )
             return True
+async def update_user_role_in_user_group(group_user_details, user):
+    if not group_user_details.assistant_group_name:
+        raise ValueError("Group name is required.")
+ 
+    if not group_user_details.email:
+        raise ValueError("Email is required.")
+ 
+    if not group_user_details.role_name:
+        raise ValueError("Role is required.")
+ 
+    email = group_user_details.email.lower()
+    groups_container = get_container_client("organization_groups")
+    users_container = get_container_client("group_users")
+ 
+    # 1. Get the old and new group records by role
+    role_to_check = 'user' if group_user_details.role_name.lower() == 'admin' else 'admin'
+ 
+    # Old group (current role)
+    old_group_query = """
+    SELECT * FROM c WHERE c.assistant_group_name = @group_name AND c.role_name = @role_to_check
+    """
+    old_group_params = [
+        {"name": "@group_name", "value": group_user_details.assistant_group_name},
+        {"name": "@role_to_check", "value": role_to_check}
+    ]
+    old_group_items = groups_container.query_items(
+        query=old_group_query,
+        parameters=old_group_params,
+        enable_cross_partition_query=True
+    )
+    org_group_old = None
+    async for item in old_group_items:
+        org_group_old = item
+        break
+ 
+    # New group (target role)
+    new_group_query = """
+    SELECT * FROM c WHERE c.assistant_group_name = @group_name AND c.role_name = @role_name
+    """
+    new_group_params = [
+        {"name": "@group_name", "value": group_user_details.assistant_group_name},
+        {"name": "@role_name", "value": group_user_details.role_name.lower()}
+    ]
+    new_group_items = groups_container.query_items(
+        query=new_group_query,
+        parameters=new_group_params,
+        enable_cross_partition_query=True
+    )
+    org_group_new = None
+    async for item in new_group_items:
+        org_group_new = item
+        break
+ 
+    if not org_group_old or not org_group_new:
+        raise ValueError("Group not found.")
+ 
+    # 2. Check user permission to update user in group
+    group_checker = await _check_group_permission(
+        group_user_details.assistant_group_name,
+        user,
+        groups_container
+    )
+    if not group_checker:
+        raise AuthError("Unauthorized to update user in group.", 403)
+ 
+    if org_group_old.get("created_by", "").lower() == email:
+        raise ValueError("Group creator role cannot be changed.")
+ 
+    # 3. Find the user record in group_users container
+    user_query = """
+    SELECT * FROM c WHERE c.group_id = @group_id AND c.email = @user_email
+    """
+    user_params = [
+        {"name": "@group_id", "value": org_group_old["group_id"]},
+        {"name": "@user_email", "value": email}
+    ]
+    user_items = users_container.query_items(
+        query=user_query,
+        parameters=user_params,
+        enable_cross_partition_query=True
+    )
+    user_record = None
+    async for item in user_items:
+        user_record = item
+        break
+ 
+    if not user_record:
+        raise ValueError("User not found in group.")
+ 
+    # 4. Update user record to new group_id and role
+    # Remove from old group_users
+    await users_container.delete_item(
+        item=user_record["id"],
+        partition_key=user_record["group_id"]
+    )
+ 
+    # Add to new group_users
+    import uuid
+    from datetime import datetime
+    new_user_doc = {
+        "id": str(uuid.uuid4()),
+        "group_id": org_group_new["group_id"],
+        "email": email,
+        "status": user_record.get("status"),
+        "created_at": user_record.get("created_at"),
+        "joined_at": user_record.get("joined_at"),
+        "role_name": group_user_details.role_name.lower(),
+        "updated_at": datetime.utcnow().isoformat()
+    }
+    await users_container.create_item(body=new_user_doc, partition_key=org_group_new["group_id"])
+ 
+    # 5. Update members array in both old and new group docs
+    try:
+        # Remove from old group members
+        old_members = org_group_old.get("members", [])
+        old_members = [m for m in old_members if m.get("email", "").lower() != email]
+        await groups_container.patch_item(
+            item=org_group_old["id"],
+            partition_key=org_group_old["group_id"],
+            patch_operations=[
+                {
+                    "op": "replace",
+                    "path": "/members",
+                    "value": old_members
+                }
+            ]
+        )
+        # Add to new group members
+        new_members = org_group_new.get("members", [])
+        new_members.append({
+            "email": email,
+            "role_name": group_user_details.role_name.lower(),
+            "status": user_record.get("status"),
+            "created_at": user_record.get("created_at"),
+            "joined_at": user_record.get("joined_at")
+        })
+        await groups_container.patch_item(
+            item=org_group_new["id"],
+            partition_key=org_group_new["group_id"],
+            patch_operations=[
+                {
+                    "op": "replace",
+                    "path": "/members",
+                    "value": new_members
+                }
+            ]
+        )
+    except Exception as e:
+        log.warning(f"Could not update group members list: {str(e)}")
+ 
+    return True
 
-
-async def update_user_group(assistant_group_name, group_details, user):
+async def update_user_group1(assistant_group_name, group_details, user):
     if not assistant_group_name.strip():
         raise ValueError("Assistant Group Name is required.")
 
@@ -506,3 +1035,55 @@ async def update_user_group(assistant_group_name, group_details, user):
                 return {"message": f"Group updated successfully"}
             except:
                 return {"message": f"Unable to update group"}
+async def update_user_group(assistant_group_name, group_details, user):
+    if not assistant_group_name.strip():
+        raise ValueError("Assistant Group Name is required.")
+ 
+    if not group_details.group_title.strip():
+        raise ValueError("Group Name is required.")
+ 
+    if not group_details.group_description.strip():
+        raise ValueError("Group Description is required.")
+ 
+    # Check user permission
+    group_checker = await _check_group_permission(assistant_group_name, user)
+ 
+    if not group_checker:
+        raise AuthError("Unauthorized to update group.", 403)
+ 
+    organization_groups_container = await get_container_client("organization_groups")
+ 
+    # Query the group document
+    query = """
+    SELECT * FROM c
+    WHERE c.assistant_group_name = @assistant_group_name
+    """
+    parameters = [{"name": "@assistant_group_name", "value": assistant_group_name}]
+ 
+    items = organization_groups_container.query_items(
+        query=query,
+        parameters=parameters,
+        enable_cross_partition_query=True,
+    )
+ 
+    results = [item async for item in items]
+ 
+    if not results:
+        raise ValueError("Group not found.")
+ 
+    group_doc = results[0]
+    group_id = group_doc["id"]  # Cosmos document id
+    partition_key = group_doc["assistant_group_name"]
+ 
+    # Update values
+    group_doc["group_title"] = group_details.group_title
+    group_doc["group_description"] = group_details.group_description
+    group_doc["updated_at"] = datetime.utcnow().isoformat()
+    group_doc["updated_by"] = user.email
+ 
+    await organization_groups_container.replace_item(
+            item=group_id,
+            body=group_doc,
+            partition_key=partition_key
+        )
+    return {"message": "Group updated successfully"}

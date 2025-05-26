@@ -29,7 +29,7 @@ def _validate_summary_title(title: str):
     if len(title) > 100:
         raise ValueError("Title cannot exceed 100 characters.")
     
-async def create_summary_record(user: User, summary):
+async def create_summary_record1(user: User, summary):
 
     if not summary.thread_id:
         raise ValueError("thread_id is required.")
@@ -64,7 +64,7 @@ async def create_summary_record(user: User, summary):
             await session.flush()
 
             return new_summary.to_dict()
-
+#old code
 # async def create_summary_record(user: User, summary):
 
 #     if not summary.thread_id:
@@ -113,8 +113,45 @@ async def create_summary_record(user: User, summary):
 #             return new_summary
 
 
+async def create_summary_record(user: User, summary):
+    if not summary.thread_id:
+        raise ValueError("thread_id is required.")
+
+    _validate_summary_title(summary.title)
+
+    async with async_session_maker() as session:
+        async with session.begin():
+            existing_record = await _get_summary_record(summary.thread_id, session)
+
+            if existing_record:
+                raise ValueError("Thread ID already exists")
+
+            assistants = await get_assistant_by_code(
+                user.groups, summary.assistant_code, session
+            )
+
+            if assistants is None:
+                raise ValueError("Invalid assistant_code provided")
+
+            logging.info(f"assistant: {assistants}")
+
+            new_summary = {
+                "id": str(uuid.uuid4()),
+                "user_id": user.id,
+                "assistant_id": assistants.id,
+                "title": summary.title,
+                "num_of_messages": summary.num_of_messages,
+                "status": summary.status or "active",
+                "thread_id": str(summary.thread_id)
+            }
+
+            conv_sum_con = await get_container_client("conversation_summary")
+            await conv_sum_con.create_item(body=new_summary)
+
+            return new_summary
+
 # Function to update an existing conversation summary record
-async def update_summary_record(thread_id, user: User, summary):
+async def update_summary_record1(thread_id, user: User, summary):
         
     async with async_session_maker() as session:
         async with session.begin():
@@ -151,6 +188,59 @@ async def update_summary_record(thread_id, user: User, summary):
 
                 return record.to_dict()
 
+async def update_summary_record(thread_id, user: User, summary):
+    # Step 1: Validate assistant
+    async with async_session_maker() as session:
+        async with session.begin():
+            assistants = await get_assistant_by_code(
+                user.groups, summary.assistant_code, session
+            )
+            if assistants is None:
+                raise ValueError("Invalid assistant_code provided")
+
+    # Step 2: Get Cosmos DB container
+    conv_sum_con = await get_container_client("conversation_summary")
+
+    # Step 3: Fetch record from Cosmos DB
+    query = """
+        SELECT * FROM c
+        WHERE c.thread_id = @thread_id AND c.user_id = @user_id
+    """
+    parameters = [
+        {"name": "@thread_id", "value": str(thread_id)},
+        {"name": "@user_id", "value": user.id}
+    ]
+
+    items = conv_sum_con.query_items(
+        query=query,
+        parameters=parameters,
+        enable_cross_partition_query=True
+    )
+
+    records = [item async for item in items]
+    if not records:
+        raise ValueError("Record not found")
+
+    record = records[0]
+
+    # Step 4: Update fields (just like in PostgreSQL)
+    if summary.title:
+        _validate_summary_title(summary.title)
+        record["title"] = summary.title
+
+    record["num_of_messages"] = summary.num_of_messages
+
+    if summary.status:
+        record["status"] = summary.status
+
+    record["updated_at"] = datetime.now().isoformat()
+    record["assistant_id"] = assistants.id
+
+    # Step 5: Upsert (replace or update)
+    await conv_sum_con.upsert_item(body=record)
+
+    # Step 6: Return record (already dict)
+    return record
 
 async def _get_summary_record1(thread_id, session: AsyncSession):
     """
@@ -185,7 +275,7 @@ async def _get_summary_record(thread_id, session: AsyncSession):
 
     # return record
 
-def _create_ordering_list(order_by: str):
+def _create_ordering_list1(order_by: str):
     """
     Create an ordering list based on the provided order_by string.
     The order_by parameter should be in the format "field_name [asc|desc]".
@@ -225,8 +315,34 @@ def _create_ordering_list(order_by: str):
         return [order_clause]
     else:
         return [order_clause, ConversationSummary.updated_at.desc()]
-
-async def get_summary_records(user: User, page: int = 1, per_page: int = 10, order_by: str = None):
+def _create_ordering_list(order_by: str) -> str:
+    """
+    Create an ORDER BY clause string for Cosmos DB based on the provided order_by string.
+    The order_by parameter should be in the format "field_name [asc|desc]".
+    If no direction is provided, ascending order is used by default.
+    If the field is not recognized, defaults to updated_at DESC.
+    Always adds updated_at DESC as a tie-breaker unless it's already the primary field.
+    """
+    default_ordering = "c.updated_at DESC"
+ 
+    if not order_by:
+        return default_ordering
+ 
+    parts = order_by.split()
+    field_name = parts[0]
+    direction = parts[1].upper() if len(parts) > 1 and parts[1].lower() in ['asc', 'desc'] else 'ASC'
+ 
+    # Define valid fields from both ConversationSummary and Assistants
+    valid_fields = ['updated_at', 'title', 'assistant_name', 'created_at']
+ 
+    if field_name not in valid_fields:
+        return default_ordering
+ 
+    if field_name == 'updated_at':
+        return f"c.updated_at {direction}"
+    else:
+        return f"c.{field_name} {direction}, c.updated_at DESC"
+async def get_summary_records1(user: User, page: int = 1, per_page: int = 10, order_by: str = None):
     """
     Fetch the conversation history for a specific user based on user_id.
     """
@@ -263,7 +379,65 @@ async def get_summary_records(user: User, page: int = 1, per_page: int = 10, ord
             log.exception("Error while fetching conversation history")
             # Handle the exception gracefully
             return {"total_records": 0, "records": []}
-
+async def get_summary_records(user: User, page: int = 1, per_page: int = 10, order_by: str = None):
+    """
+    Fetch the conversation history for a specific user from Cosmos DB.
+    """
+    try:
+        conversation_container = await get_container_client("conversation_summary")
+       
+        order_clause = _create_ordering_list(order_by)
+        query = f"""
+        SELECT * FROM c
+        WHERE c.user_id = @user_id
+        ORDER BY {order_clause}
+        """
+ 
+        parameters = [{"name": "@user_id", "value": user.id}]
+ 
+        items_iterable = conversation_container.query_items(
+            query=query,
+            parameters=parameters,
+            #enable_cross_partition_query=True
+        )
+ 
+        all_items = [item async for item in items_iterable]
+ 
+        total_count = len(all_items)
+ 
+        # Paginate the results manually
+        start = (page - 1) * per_page
+        end = start + per_page
+        paginated_items = all_items[start:end]
+ 
+        # Optionally fetch assistant names if not denormalized
+        assistants_map = {}
+        assistant_container = await get_container_client("assistants")
+       
+        # Build assistant_id set
+        assistant_ids = {item["assistant_id"] for item in paginated_items}
+        if assistant_ids:
+            placeholders = ",".join(f"@id{i}" for i in range(len(assistant_ids)))
+            parameters = [{"name": f"@id{i}", "value": aid} for i, aid in enumerate(assistant_ids)]
+            query = f"SELECT * FROM c WHERE c.id IN ({placeholders})"
+            assistant_items = assistant_container.query_items(
+                query=query,
+                parameters=parameters,
+                #enable_cross_partition_query=True
+            )
+            async for a in assistant_items:
+                assistants_map[a["id"]] = a.get("assistant_name", "")
+ 
+        records = [
+            item | {"assistant_name": assistants_map.get(item["assistant_id"], "")}
+            for item in paginated_items
+        ]
+ 
+        return {"total_records": total_count, "records": records}
+ 
+    except Exception as e:
+        log.exception("Error while fetching conversation history from Cosmos DB")
+        return {"total_records": 0, "records": []}
 
 async def delete_summary_record(thread_id: str, user: User, assistant_code: str = None):
     async with async_session_maker() as session:
@@ -292,7 +466,7 @@ async def delete_summary_record(thread_id: str, user: User, assistant_code: str 
 
 
 # Function to mark or unmark a conversation as favorite
-async def mark_conversation_favorite(thread_id, favorite, user: User):
+async def mark_conversation_favorite1(thread_id, favorite, user: User):
         
     async with async_session_maker() as session:
         async with session.begin():
@@ -315,8 +489,24 @@ async def mark_conversation_favorite(thread_id, favorite, user: User):
                 # record.updated_at = datetime.now()  # Do not update updated_at to prevent immediate sorting
 
                 return record.to_dict()
+            
+async def mark_conversation_favorite(thread_id, favorite, user: User):
+    conv_sum_con = await get_container_client("conversation_summary")
 
-async def get_conversation_summary_details(thread_id, user: User):
+    try:
+        item = await conv_sum_con.read_item(item=thread_id, partition_key=user.id)
+    except Exception:
+        raise ValueError("Record not found")
+
+    favorite_flag = True if favorite.favorite_flag == True else False
+    item['favorite'] = favorite_flag
+    # Do not update updated_at
+
+    await conv_sum_con.replace_item(item=thread_id, body=item)
+
+    return item  # Cosmos DB item is already a dictionary
+
+async def get_conversation_summary_details1(thread_id, user: User):
     """
     Fetch the conversation summary for a specific user based on thread_id.
     """
@@ -336,3 +526,29 @@ async def get_conversation_summary_details(thread_id, user: User):
             log.exception("Error while fetching conversation summary")
             # Handle the exception gracefully
             return {"record": []}
+async def get_conversation_summary_details(thread_id: str, user: User):
+ 
+        summary_container = await get_container_client("conversation_summary")
+ 
+        query = """
+        SELECT * FROM c
+        WHERE c.thread_id = @thread_id AND c.user_id = @user_id
+        """
+ 
+        parameters = [
+            {"name": "@thread_id", "value": thread_id},
+            {"name": "@user_id", "value": user.id},
+        ]
+ 
+        items = summary_container.query_items(
+            query=query,
+            parameters=parameters,
+           # enable_cross_partition_query=True,
+        )
+ 
+        results = [item async for item in items]
+       
+        # Return the first result or None
+        record = results[0] if results else None
+ 
+        return {"record": record}
