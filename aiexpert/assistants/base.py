@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 ASSISTANT_CODE_LENGTH = 32
 
 
-async def get_assistant_by_code(groups, assistant_code, session: AsyncSession = None):
+async def get_assistant_by_code1(groups, assistant_code, session: AsyncSession = None):
     async def _run_query(session: AsyncSession):
         results = await session.execute(
             select(Assistants)
@@ -38,7 +38,7 @@ async def get_assistant_by_code(groups, assistant_code, session: AsyncSession = 
         
 
 
-async def get_assistant_by_code1(groups, assistant_code, session=None):
+async def get_assistant_by_code(groups, assistant_code, session=None):
     async def _run_query(session):
         assistants_container = await get_container_client("assistants")
         permissions_container = await get_container_client("assistant_permissions")
